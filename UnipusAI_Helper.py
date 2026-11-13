@@ -2140,13 +2140,63 @@ const maxDur = (typeof arguments[2] === 'number') ? arguments[2] : 0;
 })().catch((e) => done({ ok: false, err: String(e) }));
 """
 
-RECORD_ITEMS_JS = r"""
+# 录音题的按钮列表与「句子行」解析，两段 JS 共用同一份实现。
+#
+# 按钮必须按「主选择器 → 兜底」逐个试、取第一组可见的，跟 find_record_buttons()
+# 完全一致：Python 点的是哪一份列表，JS 读状态就必须是同一份，否则索引一错位
+# 就会把别的行当成这一条，又回到「已录完却判没录」。可见性与尺寸（小于 180px）
+# 的过滤也要同步，否则隐藏副本或容器元素会把索引顶偏。
+#
+# 行从按钮向上爬，两个停止条件各有用途：上层出现第二个可见按钮说明跨行了，
+# 停在当前层免把相邻句子算进来；这层已经有 .score_layout 也停，再往上会包含
+# 材料音频，会把「题目自带原声」误判成已上传。爬升不越过 root。
+RECORD_ROW_HELPER_JS = r"""
+const __recSelectors = (arguments[2] && arguments[2].length)
+  ? arguments[2] : ['.record-icon.button-record'];
+let __recWinSel = __recSelectors[0];
+
+function __recVisible(el) {
+  if (!el || !el.getClientRects || !el.getClientRects().length) { return false; }
+  const rect = el.getBoundingClientRect();
+  return rect.width <= 180 && rect.height <= 180;
+}
+
+function __recVisibleIn(scope) {
+  if (!scope || !scope.querySelectorAll) { return []; }
+  return Array.from(scope.querySelectorAll(__recWinSel)).filter(__recVisible);
+}
+
+function __recButtons(root) {
+  for (let i = 0; i < __recSelectors.length; i++) {
+    const list = Array.from(root.querySelectorAll(__recSelectors[i])).filter(__recVisible);
+    if (list.length) {
+      __recWinSel = __recSelectors[i];
+      return list;
+    }
+  }
+  return [];
+}
+
+function __recRowOf(button, root) {
+  let row = button;
+  while (row && row !== root && row.parentElement && row.parentElement !== document.body) {
+    if (__recVisibleIn(row.parentElement).length > 1) { break; }
+    row = row.parentElement;
+    if (row.querySelector && row.querySelector('.score_layout')) { break; }
+  }
+  return row || button;
+}
+"""
+
+RECORD_ITEMS_JS = RECORD_ROW_HELPER_JS + r"""
 const root = arguments[0] || document;
+// 先跑一次选择器，让 __recWinSel 落到 Python 实际用的那个选择器上
+__recButtons(root);
 return Array.from(arguments[1])
   .map(function (button) {
     const wrap = button.closest('.record-button-wrap');
     const paragraph = button.closest('.oral-paragraph-container');
-    const row = button.closest('.oral-study-sentence') || paragraph || root;
+    const row = __recRowOf(button, root);
     // 段落跟读的样音在播放器中，回放录音在另一只 record-button-wrap 中。
     const audio = paragraph
       ? paragraph.querySelector('.paragraphPlayerContainer audio:not(.audio-replay audio)')
@@ -2156,7 +2206,7 @@ return Array.from(arguments[1])
     const passage = paragraph && paragraph.querySelector('.sentence-html-container');
     const text = passage ? (passage.innerText || '').replace(/\([wWsS]\)/g, ' ') : '';
     const lines = row ? ((row.innerText || '').split('\n').map(function (s) { return s.trim(); })
-      .filter(function (s) { return s.length > 0; })) : [];
+      .filter(function (s) { return s.length > 0 && !/^\d{1,3}$/.test(s); })) : [];
     return {
       raw: raw,
       name: text.trim() || (lines.length ? lines[0] : ''),
@@ -2167,43 +2217,24 @@ return Array.from(arguments[1])
   });
 """
 
-RECORD_ROW_STATE_JS = r"""
-return (function (root, idx, selectors) {
+RECORD_ROW_STATE_JS = RECORD_ROW_HELPER_JS + r"""
+return (function (root, idx) {
   const blank = { text: '', score: null, stop: false, wave: '', recorded: false,
                   htmlLen: 0, blob: 0, uploaded: 0 };
   if (!root) { return blank; }
-  const sel = (selectors && selectors.length) ? selectors.join(',') : '.record-icon.button-record';
-  let rows;
-  try {
-    rows = (root.matches && root.matches('.oral-study-sentence'))
-      ? [root]
-      : Array.from(root.querySelectorAll('.oral-study-sentence'));
-  } catch (e) { rows = []; }
-  if (!rows.length) {
-    try { rows = Array.from(root.querySelectorAll('.record-button-group')); } catch (e) { rows = []; }
-  }
-  if (!rows.length) { rows = [root]; }
-  const row = rows[idx] || rows[0];
-  if (!row) { return blank; }
-  // Exercise 2 这类自由作答的分数与回放挂在再上一层 .p-oral-personal-state 上，
-  // 麦克风按钮所在的 .record-button-group 里什么都没有，所以要看更大的作用域。
-  // 但只有「整块里就一个录音按钮」时才上扩，避免跟读题多行共用外层时串分。
-  let scope = row;
-  const outer = row.closest('.oral-paragraph-container, .p-oral-personal-state');
-  if (outer && !row.querySelector('.score_layout') &&
-      outer.querySelectorAll(sel).length === 1) {
-    scope = outer;
-  }
-  const node = row.querySelector('.score_layout') || scope.querySelector('.score_layout');
+  const buttons = __recButtons(root);
+  const button = buttons[idx] || buttons[0];
+  if (!button) { return blank; }
+  const row = __recRowOf(button, root);
+  const node = row.querySelector('.score_layout');
   const text = node ? ((node.innerText || node.textContent || '').trim()) : '';
   const match = text.match(/(\d{1,3})/);
-  const icon = row.querySelector(sel);
   // 录音中图标会换成实心方块，空闲时 svg 里只有一个 opacity=0 的 rect
-  const stop = !!(icon && icon.querySelector('svg rect[fill="currentColor"]'));
-  const waveNode = scope.querySelector('.audio-control-box.audio-control-wave');
+  const stop = !!(button.querySelector('svg rect[fill="currentColor"]'));
+  const waveNode = row.querySelector('.audio-control-box.audio-control-wave');
   // 录完之后平台会上传音频并给一个可回放的 <audio src="http://...mp3">；
   // 题目自带原声放在 .record-button-wrap 里，不能算作答结果。
-  const audios = Array.from(scope.querySelectorAll('audio')).filter(function (a) {
+  const audios = Array.from(row.querySelectorAll('audio')).filter(function (a) {
     if (a.closest('.paragraphPlayerContainer')) { return false; }
     if (a.closest('.record-button-wrap') && !a.closest('.audio-replay')) { return false; }
     return ((a.getAttribute('src') || '').length > 0);
@@ -2219,11 +2250,11 @@ return (function (root, idx, selectors) {
     stop: stop,
     wave: waveNode ? waveNode.className : '',
     recorded: (blob + uploaded) > 0,
-    htmlLen: (scope.innerHTML || '').length,
+    htmlLen: (row.innerHTML || '').length,
     blob: blob,
     uploaded: uploaded
   };
-})(arguments[0], arguments[1], arguments[2]);
+})(arguments[0], arguments[1]);
 """
 
 RECORD_STATE_JS = r"""
@@ -2593,7 +2624,7 @@ class RecordStrategy(QuestionParserStrategy):
         # #duration=..&name=..，这里一次性用 JS 读出来，比多层 XPath 稳。
         try:
             metas = driver.execute_script(
-                RECORD_ITEMS_JS, container, buttons) or []
+                RECORD_ITEMS_JS, container, buttons, list(record_button_selectors())) or []
         except Exception:
             metas = []
 
